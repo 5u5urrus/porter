@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Porter — fast, clean TCP connect port scanner (Windows/macOS/Linux)
+Porter - fast, clean TCP connect port scanner (Windows/macOS/Linux)
 Author: Vahe Demirkhanyan
 """
 
@@ -30,6 +30,77 @@ def expand_targets(arg: str) -> List[str]:
         return [str(ip) for ip in net.hosts()]
     except ValueError:
         return [arg.strip()]
+
+
+def _expand_ipv4_last_octet_range(token: str) -> List[str]:
+    """
+    Expand IPv4 short-range form: a.b.c.X-Y
+    Example: 1.1.1.10-15 -> [1.1.1.10, ..., 1.1.1.15]
+    If token doesn't match that pattern, return [token] unchanged.
+    """
+    s = token.strip()
+    if not s:
+        return []
+
+    # must be IPv4-ish with exactly one dash in the last octet section
+    # and exactly 3 dots total
+    if s.count(".") != 3 or "-" not in s:
+        return [s]
+
+    left, right = s.rsplit(".", 1)
+    if "-" not in right:
+        return [s]
+
+    a_str, b_str = right.split("-", 1)
+    if not (a_str.isdigit() and b_str.isdigit()):
+        return [s]
+
+    try:
+        base_ip = ipaddress.IPv4Address(f"{left}.0")
+    except Exception:
+        return [s]
+
+    a = int(a_str)
+    b = int(b_str)
+    if not (0 <= a <= 255 and 0 <= b <= 255):
+        return [s]
+    if a > b:
+        a, b = b, a
+
+    # validate left part is 3 octets
+    parts = left.split(".")
+    if len(parts) != 3 or any((not p.isdigit()) or not (0 <= int(p) <= 255) for p in parts):
+        return [s]
+
+    return [f"{left}.{i}" for i in range(a, b + 1)]
+
+
+def parse_target_arg(arg: str) -> List[str]:
+    """
+    Accepts:
+      - single host / IP
+      - CIDR
+      - comma-separated list of the above
+      - IPv4 last-octet ranges like 1.1.1.10-15 (and can be mixed with commas)
+
+    Returns deduped targets preserving order.
+    """
+    out: List[str] = []
+    for raw in arg.split(","):
+        tok = raw.strip()
+        if not tok:
+            continue
+
+        # CIDR expansion (existing behavior)
+        if "/" in tok:
+            out.extend(expand_targets(tok))
+            continue
+
+        # IPv4 last-octet ranges like a.b.c.X-Y
+        expanded = _expand_ipv4_last_octet_range(tok)
+        out.extend(expanded)
+
+    return list(dict.fromkeys(out))
 
 
 def parse_ports(spec: str) -> List[int]:
@@ -101,21 +172,15 @@ def _sock_family(ip: str) -> int:
 
 
 def _jitter_seconds(ip: str, port: int) -> float:
-    # Deterministic 0..2ms jitter to de-sync burst connects.
-    # Avoids importing random; stable run-to-run.
     x = 0
     for ch in ip:
-        x = ((x << 5) - x) + ord(ch)  # x*31 + ord
+        x = ((x << 5) - x) + ord(ch)
         x &= 0xFFFFFFFF
     x ^= (port * 2654435761) & 0xFFFFFFFF
-    return (x % 2001) / 1_000_000.0  # 0..0.002 seconds
+    return (x % 2001) / 1_000_000.0
 
 
 async def connect_probe(ip: str, port: int, timeout_s: float) -> str:
-    """
-    Returns: "open" | "closed" | "timeout" | "filtered"
-    Uses non-blocking socket + loop.sock_connect + wait_for, then ALWAYS closes the socket.
-    """
     loop = asyncio.get_running_loop()
     fam = _sock_family(ip)
     sock = socket.socket(fam, socket.SOCK_STREAM)
@@ -144,7 +209,6 @@ class Scanner:
         self.targets = targets
         self.ports = order_ports(ports)
 
-        # internal safety clamp (no CLI change)
         self.conc = max(1, min(int(conc), 1024))
 
         self.tfast = float(tfast)
@@ -158,7 +222,7 @@ class Scanner:
         self.ips_by_target: List[List[str]] = [[] for _ in targets]
 
         self.opens_by_target: List[Set[int]] = [set() for _ in targets]
-        self.timeouts: Set[Tuple[int, str, int]] = set()  # (target_idx, ip, port)
+        self.timeouts: Set[Tuple[int, str, int]] = set()
 
     async def resolve_all(self):
         for i, t in enumerate(self.targets):
@@ -210,7 +274,6 @@ class Scanner:
 
         for w in workers:
             w.cancel()
-        # await cancellation for hygiene (prevents rare lingering-task weirdness)
         for w in workers:
             with contextlib.suppress(asyncio.CancelledError):
                 await w
@@ -258,10 +321,8 @@ class Scanner:
 
 
 def main():
-    ap = argparse.ArgumentParser(
-        description="PortX — fast TCP connect port scanner (Windows/macOS/Linux)"
-    )
-    ap.add_argument("target", help="Host, CIDR, or file with one target per line")
+    ap = argparse.ArgumentParser(description="PortX — fast TCP connect port scanner (Windows/macOS/Linux)")
+    ap.add_argument("target", help="Host, CIDR, comma-list, IPv4 short ranges, or file with one target per line")
     ap.add_argument("-p", "--ports", default="1-1000",
                     help="Ports: e.g. 80,443 or 1-65535 or 'popular' (default: 1-1000)")
     ap.add_argument("-c", "--concurrency", type=int, default=300,
@@ -276,17 +337,20 @@ def main():
                     help="Only print opens (suppress info lines)")
     args = ap.parse_args()
 
+    # targets:
+    # - if file: each line can itself be a single host/cidr/comma list/range
+    # - else: args.target can be a single host/cidr/comma list/range
+    targets: List[str] = []
     if os.path.isfile(args.target):
-        targets: List[str] = []
         with open(args.target, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#"):
                     continue
-                targets.extend(expand_targets(line))
+                targets.extend(parse_target_arg(line))
         targets = list(dict.fromkeys(targets))
     else:
-        targets = list(dict.fromkeys(expand_targets(args.target)))
+        targets = parse_target_arg(args.target)
 
     ports = parse_ports(args.ports)
     if not ports:
