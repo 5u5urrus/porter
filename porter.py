@@ -321,7 +321,7 @@ class Scanner:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="PortX — fast TCP connect port scanner (Windows/macOS/Linux)")
+    ap = argparse.ArgumentParser(description="Porter - fast TCP connect port scanner (Windows/macOS/Linux)")
     ap.add_argument("target", help="Host, CIDR, comma-list, IPv4 short ranges, or file with one target per line")
     ap.add_argument("-p", "--ports", default="1-1000",
                     help="Ports: e.g. 80,443 or 1-65535 or 'popular' (default: 1-1000)")
@@ -359,7 +359,7 @@ def main():
 
     if not args.quiet:
         print(
-            f"[PortX] targets={len(targets)} ports={len(ports)} "
+            f"[Porter] targets={len(targets)} ports={len(ports)} "
             f"concurrency={args.concurrency} timeouts=({args.tfast:.2f}s/{args.tslow:.2f}s) "
             f"retry={'on' if not args.no_retry else 'off'}"
         )
