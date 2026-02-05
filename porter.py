@@ -23,8 +23,6 @@ POPULAR_PORTS = [
     853, 8530, 4369, 5432, 27018, 27019, 25565
 ]
 
-# Nmap-style "top 1000" port set as a compact spec (comma + ranges).
-# Source: SecLists nmap-ports-top1000.txt (single-line spec).  :contentReference[oaicite:2]{index=2}
 TOP1000_SPEC = (
     "1,3-4,6-7,9,13,17,19-26,30,32-33,37,42-43,49,53,70,79-85,88-90,99-100,"
     "106,109-111,113,119,125,135,139,143-144,146,161,163,179,199,211-212,222,"
