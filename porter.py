@@ -13,8 +13,60 @@ import os
 import socket
 import sys
 import time
+from collections import defaultdict
 from typing import Dict, List, Set, Tuple
 
+
+# ---------- Optional deps ----------
+try:
+    from colorama import init as colorama_init, Fore, Style
+    _COLORAMA = True
+except ImportError:
+    _COLORAMA = False
+
+# ---------- Globals ----------
+_COLOR = False
+_IS_TTY = False
+
+
+def _c_green(t):   return (Fore.GREEN + t + Style.RESET_ALL) if _COLOR else t
+def _c_yellow(t):  return (Fore.YELLOW + t + Style.RESET_ALL) if _COLOR else t
+def _c_red(t):     return (Fore.RED + t + Style.RESET_ALL) if _COLOR else t
+def _c_dim(t):     return (Style.DIM + t + Style.RESET_ALL) if _COLOR else t
+def _c_bold(t):    return (Style.BRIGHT + t + Style.RESET_ALL) if _COLOR else t
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Service-name lookup (local table, zero network cost)
+# ═══════════════════════════════════════════════════════════════
+
+_SERVICE_CACHE: Dict[int, str] = {}
+
+
+def _svc(port: int) -> str:
+    if port in _SERVICE_CACHE:
+        return _SERVICE_CACHE[port]
+    try:
+        name = socket.getservbyport(port, "tcp")
+    except (OSError, OverflowError):
+        name = ""
+    _SERVICE_CACHE[port] = name
+    return name
+
+
+def _warm_service_cache(ports: List[int]):
+    for p in ports:
+        _svc(p)
+
+
+def _port_label(port: int) -> str:
+    s = _svc(port)
+    return f"{port}/{s}" if s else str(port)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Port lists
+# ═══════════════════════════════════════════════════════════════
 
 POPULAR_PORTS = [
     80, 443, 22, 3389, 445, 1433, 3306, 53, 25, 110, 143, 995, 993, 587, 465,
@@ -73,6 +125,10 @@ TOP1000_SPEC = (
     "60020,60443,61532,61900,62078,63331,64623,64680,65000,65129,65389,280,4567,7001,8008,9080"
 )
 
+
+# ═══════════════════════════════════════════════════════════════
+#  Target/port parsing
+# ═══════════════════════════════════════════════════════════════
 
 def expand_targets(arg: str) -> List[str]:
     try:
@@ -150,6 +206,20 @@ def order_ports(ports: List[int]) -> List[int]:
     return sorted(ports, key=lambda p: (0, rank[p]) if p in rank else (1, p))
 
 
+def _describe_port_spec(spec: str, count: int) -> str:
+    if spec in ("top", "top1000", "nmap"):
+        return f"top 1000 ({count} ports)"
+    if spec == "popular":
+        return f"popular ({count} ports)"
+    if count <= 10:
+        return spec
+    return f"{count} ports"
+
+
+# ═══════════════════════════════════════════════════════════════
+#  DNS resolver
+# ═══════════════════════════════════════════════════════════════
+
 class Resolver:
     def __init__(self) -> None:
         self._cache: Dict[str, List[str]] = {}
@@ -190,6 +260,10 @@ class Resolver:
         return ips
 
 
+# ═══════════════════════════════════════════════════════════════
+#  Connect probe
+# ═══════════════════════════════════════════════════════════════
+
 def _sock_family(ip: str) -> int:
     return socket.AF_INET6 if ":" in ip else socket.AF_INET
 
@@ -201,6 +275,23 @@ def _jitter_seconds(ip: str, port: int) -> float:
         x &= 0xFFFFFFFF
     x ^= (port * 2654435761) & 0xFFFFFFFF
     return (x % 2001) / 1_000_000.0
+
+
+# Local / transient connect failures that should be retried
+_RETRYABLE_ERRNOS = {
+    getattr(errno, "EADDRNOTAVAIL", 99),
+    getattr(errno, "EADDRINUSE", 98),
+    getattr(errno, "ENOBUFS", 105),
+    getattr(errno, "EMFILE", 24),
+    getattr(errno, "ENFILE", 23),
+    getattr(errno, "ETIMEDOUT", 110),
+    # Windows WSA*
+    10048,  # WSAEADDRINUSE
+    10049,  # WSAEADDRNOTAVAIL
+    10055,  # WSAENOBUFS
+    10060,  # WSAETIMEDOUT
+    10024,  # WSAEMFILE
+}
 
 
 async def connect_probe(ip: str, port: int, timeout_s: float) -> str:
@@ -219,11 +310,17 @@ async def connect_probe(ip: str, port: int, timeout_s: float) -> str:
         code = getattr(e, "errno", None)
         if isinstance(e, ConnectionRefusedError) or code in {errno.ECONNREFUSED, 10061}:
             return "closed"
+        if code in _RETRYABLE_ERRNOS:
+            return "timeout"
         return "filtered"
     finally:
         with contextlib.suppress(Exception):
             sock.close()
 
+
+# ═══════════════════════════════════════════════════════════════
+#  Scanner
+# ═══════════════════════════════════════════════════════════════
 
 class Scanner:
     def __init__(self, targets: List[str], ports: List[int],
@@ -245,6 +342,53 @@ class Scanner:
         self.opens_by_target: List[Set[int]] = [set() for _ in targets]
         self.timeouts: Set[Tuple[int, str, int]] = set()
 
+        self._probes_done = 0
+        self._probes_total = 0
+        self._timeout_count = 0
+        self._open_total = 0
+
+        self._last_progress_t = 0.0
+        self._progress_active = False
+
+    def _clear_progress(self):
+        if self._progress_active and _IS_TTY:
+            sys.stderr.write("\r" + " " * 78 + "\r")
+            sys.stderr.flush()
+            self._progress_active = False
+
+    def _maybe_progress(self, label: str):
+        if self.quiet or not _IS_TTY:
+            return
+        now = time.monotonic()
+        if now - self._last_progress_t < 1.0:
+            return
+        self._last_progress_t = now
+
+        done = self._probes_done
+        total = self._probes_total
+        if total <= 0:
+            return
+
+        pct = done * 100 // total
+        bar_w = 20
+        filled = pct * bar_w // 100
+        bar = "#" * filled + "-" * (bar_w - filled)
+        open_str = f"{self._open_total} open" if self._open_total else "0 open"
+
+        text = f"  [{label}] [{bar}] {done:,}/{total:,} ({pct}%)  {open_str}"
+        sys.stderr.write("\r" + text.ljust(78))
+        sys.stderr.flush()
+        self._progress_active = True
+
+    def _emit_open(self, target: str, port: int):
+        svc = _svc(port)
+        svc_part = f"  {svc}" if svc else ""
+        self._clear_progress()
+        print(
+            f" {_c_green('>>')} {target}:{_c_bold(str(port))}"
+            f"  {_c_green('open')}{_c_dim(svc_part)}"
+        )
+
     async def resolve_all(self):
         for i, t in enumerate(self.targets):
             ips = await self.resolver.resolve(t)
@@ -254,21 +398,35 @@ class Scanner:
             if not ips:
                 self.dns_failed.add(i)
                 self.ips_by_target[i] = []
+                if not self.quiet:
+                    print(f"  {_c_red('!')} {t} — DNS resolution failed, skipping")
             else:
                 self.ips_by_target[i] = ips
+                if not self.quiet and t != ips[0]:
+                    print(_c_dim(f"  > {t} -> {', '.join(ips)}"))
 
     async def _run_pass(self, timeout_s: float, pass_id: int):
-        q: asyncio.Queue = asyncio.Queue()
+        label = "Scan" if pass_id == 1 else "Retry"
+        q: asyncio.Queue = asyncio.Queue(maxsize=max(1, self.conc * 4))
 
-        for port in self.ports:
-            for ti, t in enumerate(self.targets):
+        # Compute total probes for this pass up-front (stable progress)
+        if pass_id == 1:
+            ip_count = 0
+            for ti in range(len(self.targets)):
                 if ti in self.dns_failed:
                     continue
-                for ip in self.ips_by_target[ti]:
-                    q.put_nowait((ti, t, ip, port))
+                ip_count += len(self.ips_by_target[ti])
+            self._probes_total += ip_count * len(self.ports)
 
-        for _ in range(self.conc):
-            q.put_nowait(None)
+        async def producer():
+            for port in self.ports:
+                for ti, t in enumerate(self.targets):
+                    if ti in self.dns_failed:
+                        continue
+                    for ip in self.ips_by_target[ti]:
+                        await q.put((ti, t, ip, port))
+            for _ in range(self.conc):
+                await q.put(None)
 
         async def worker():
             while True:
@@ -279,19 +437,30 @@ class Scanner:
                 ti, t, ip, port = item
                 try:
                     state = await connect_probe(ip, port, timeout_s)
+                    self._probes_done += 1
+
                     if state == "open":
                         if port not in self.opens_by_target[ti]:
                             self.opens_by_target[ti].add(port)
+                            self._open_total += 1
                             if not self.quiet:
-                                print(f"{t}:{port} open")
+                                self._emit_open(t, port)
                     elif state == "timeout":
+                        self._timeout_count += 1
                         if self.retry and pass_id == 1:
                             self.timeouts.add((ti, ip, port))
+
+                    self._maybe_progress(label)
                 finally:
                     q.task_done()
 
         workers = [asyncio.create_task(worker()) for _ in range(self.conc)]
+        prod = asyncio.create_task(producer())
+
+        await prod
         await q.join()
+
+        self._clear_progress()
 
         for w in workers:
             w.cancel()
@@ -301,18 +470,34 @@ class Scanner:
 
     async def run(self):
         await self.resolve_all()
+
+        active_targets = len(self.targets) - len(self.dns_failed)
+        if active_targets == 0:
+            if not self.quiet:
+                print("  No resolvable targets — nothing to scan.")
+            return
+
         await self._run_pass(self.tfast, pass_id=1)
 
         if not self.retry or not self.timeouts:
             return
 
-        q: asyncio.Queue = asyncio.Queue()
-        for (ti, ip, port) in self.timeouts:
-            t = self.targets[ti]
-            q.put_nowait((ti, t, ip, port))
+        if not self.quiet:
+            print(
+                _c_dim(f"  [*] Retrying {len(self.timeouts):,} timed-out probes "
+                       f"with {self.tslow:.2f}s timeout...")
+            )
 
-        for _ in range(self.conc):
-            q.put_nowait(None)
+        # Retry pass probe total
+        self._probes_total += len(self.timeouts)
+
+        q: asyncio.Queue = asyncio.Queue(maxsize=max(1, self.conc * 4))
+
+        async def producer2():
+            for (ti, ip, port) in self.timeouts:
+                await q.put((ti, self.targets[ti], ip, port))
+            for _ in range(self.conc):
+                await q.put(None)
 
         async def worker2():
             while True:
@@ -323,16 +508,26 @@ class Scanner:
                 ti, t, ip, port = item
                 try:
                     state = await connect_probe(ip, port, self.tslow)
+                    self._probes_done += 1
                     if state == "open":
                         if port not in self.opens_by_target[ti]:
                             self.opens_by_target[ti].add(port)
+                            self._open_total += 1
                             if not self.quiet:
-                                print(f"{t}:{port} open")
+                                self._emit_open(t, port)
+                    elif state == "timeout":
+                        self._timeout_count += 1
+                    self._maybe_progress("Retry")
                 finally:
                     q.task_done()
 
         workers2 = [asyncio.create_task(worker2()) for _ in range(self.conc)]
+        prod2 = asyncio.create_task(producer2())
+
+        await prod2
         await q.join()
+
+        self._clear_progress()
 
         for w in workers2:
             w.cancel()
@@ -341,11 +536,119 @@ class Scanner:
                 await w
 
 
+# ═══════════════════════════════════════════════════════════════
+#  Summary rendering — clearer multi-target output
+# ═══════════════════════════════════════════════════════════════
+
+def _render_summary(scanner: Scanner, targets: List[str],
+                    elapsed: float, port_spec: str, quiet: bool):
+
+    if quiet:
+        for i, t in enumerate(targets):
+            for p in sorted(scanner.opens_by_target[i]):
+                print(f"{t}:{p}\topen\t{_svc(p)}")
+        return
+
+    total_open = sum(len(s) for s in scanner.opens_by_target)
+    hosts_with_open = sum(1 for s in scanner.opens_by_target if s)
+    multi = len(targets) > 1
+
+    print(f"\n{'─' * 64}")
+
+    if multi:
+        _render_multi_lines(scanner, targets)
+    else:
+        _render_table(scanner, targets)
+
+    mins, secs = divmod(elapsed, 60)
+    time_str = f"{int(mins)}m {secs:.1f}s" if mins else f"{secs:.2f}s"
+
+    total_probes = scanner._probes_total
+    pps = total_probes / elapsed if elapsed > 0 else 0
+
+    print(f"  Done in {time_str}  ({total_probes:,} probes, ~{pps:,.0f}/s)")
+    print(f"  Total: {total_open} open port{'s' if total_open != 1 else ''}", end="")
+    if multi:
+        print(f" across {hosts_with_open}/{len(targets)} hosts", end="")
+    print()
+
+    if total_probes > 0 and scanner._timeout_count > 0:
+        to_pct = scanner._timeout_count * 100 / total_probes
+        if to_pct > 25:
+            print(
+                _c_yellow(f"  [!] High timeout ratio: {scanner._timeout_count:,}/"
+                          f"{total_probes:,} ({to_pct:.0f}%) — "
+                          "target may be firewalled, or try reducing --concurrency")
+            )
+
+    dns_failed = len(scanner.dns_failed)
+    if dns_failed:
+        print(_c_yellow(f"  [!] DNS failed for {dns_failed} target(s)"))
+
+    if total_open == 0 and total_probes > 0:
+        hints = []
+        if port_spec in ("top", "top1000", "nmap"):
+            hints.append("try -p 1-65535 for a full port scan")
+        if scanner.tfast < 0.5:
+            hints.append("try --tfast 0.8 on lossy networks")
+        if hints:
+            print(f"  Tip: {'; '.join(hints)}")
+
+    print(f"{'─' * 64}")
+
+
+def _render_table(scanner: Scanner, targets: List[str]):
+    for i, t in enumerate(targets):
+        if i in scanner.dns_failed:
+            print(f"  {t}  — {_c_red('DNS failed')}")
+            continue
+
+        opens = sorted(scanner.opens_by_target[i])
+        if not opens:
+            print(f"  {t}  — no open ports")
+            continue
+
+        count_str = f"{len(opens)} open port{'s' if len(opens) != 1 else ''}"
+        print(f"  {_c_bold(t)}  — {_c_green(count_str)}")
+        print(_c_dim(f"  {'PORT':<12} {'STATE':<10} SERVICE"))
+
+        for p in opens:
+            svc = _svc(p)
+            port_col = f"{p}/tcp"
+            state_col = _c_green("open")
+            state_pad = 19 if _COLOR else 10
+            print(f"  {port_col:<12} {state_col:<{state_pad}} {svc}")
+
+        print()
+
+
+def _render_multi_lines(scanner: Scanner, targets: List[str]):
+    # Old-style: one host per line, clean and easy to grep/parse.
+    for i, t in enumerate(targets):
+        if i in scanner.dns_failed:
+            continue
+        opens = sorted(scanner.opens_by_target[i])
+        if not opens:
+            continue
+        port_str = ", ".join(_port_label(p) for p in opens)
+        print(f"{t}  open: {port_str}")
+    print()
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Entry point
+# ═══════════════════════════════════════════════════════════════
+
 def main():
+    global _COLOR, _IS_TTY
+    if _COLORAMA:
+        colorama_init(autoreset=True)
+    _IS_TTY = sys.stderr.isatty()
+    _COLOR = _COLORAMA and _IS_TTY
+
     ap = argparse.ArgumentParser(description="Porter — fast TCP connect port scanner (Windows/macOS/Linux)")
     ap.add_argument("target", help="Host, CIDR, comma-list, IPv4 short ranges, or file with one target per line")
 
-    # DEFAULT CHANGE: now top 1000 common ports (Nmap-style) instead of 1-1000
     ap.add_argument(
         "-p", "--ports",
         default="top",
@@ -381,12 +684,24 @@ def main():
         print("No ports to scan.", file=sys.stderr)
         sys.exit(2)
 
+    _warm_service_cache(ports)
+
     if not args.quiet:
-        print(
-            f"[Porter] targets={len(targets)} ports={len(ports)} "
-            f"concurrency={args.concurrency} timeouts=({args.tfast:.2f}s/{args.tslow:.2f}s) "
-            f"retry={'on' if not args.no_retry else 'off'}"
-        )
+        port_desc = _describe_port_spec(args.ports, len(ports))
+        tgt_preview = ""
+        if len(targets) <= 5:
+            tgt_preview = f"  ({', '.join(targets)})"
+        elif len(targets) <= 20:
+            tgt_preview = f"  ({', '.join(targets[:5])}, ...)"
+
+        print(f"\n{'─' * 64}")
+        print(f"  Porter — TCP Connect Scanner")
+        print(f"  Targets    : {len(targets)} host{'s' if len(targets) != 1 else ''}{tgt_preview}")
+        print(f"  Ports      : {port_desc}")
+        print(f"  Concurrency: {args.concurrency}   "
+              f"Timeouts: {args.tfast:.2f}s / {args.tslow:.2f}s   "
+              f"Retry: {'on' if not args.no_retry else 'off'}")
+        print(f"{'─' * 64}\n")
 
     scanner = Scanner(
         targets=targets,
@@ -395,28 +710,18 @@ def main():
         tfast=args.tfast,
         tslow=args.tslow,
         retry=(not args.no_retry),
-        quiet=args.quiet
+        quiet=args.quiet,
     )
 
     t0 = time.perf_counter()
     try:
         asyncio.run(scanner.run())
     except KeyboardInterrupt:
-        print("\n[!] Aborted.")
+        scanner._clear_progress()
+        print(f"\n  {_c_yellow('[!] Aborted.')}")
     dt = time.perf_counter() - t0
 
-    total_open = 0
-    for i, t in enumerate(targets):
-        opens = sorted(scanner.opens_by_target[i])
-        if opens:
-            print(f"{t}  open: {', '.join(map(str, opens))}")
-            total_open += len(opens)
-
-    if not args.quiet:
-        dns_failed = len(scanner.dns_failed)
-        if dns_failed:
-            print(f"[info] DNS failed: {dns_failed} target(s) were not scanned.")
-        print(f"[done] opens={total_open} in {dt:.2f}s")
+    _render_summary(scanner, targets, dt, args.ports, args.quiet)
 
 
 if __name__ == "__main__":
